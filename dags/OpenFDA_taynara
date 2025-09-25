@@ -1,0 +1,136 @@
+"""
+OpenFDA to BigQuery DAG
+DAG para buscar dados da API OpenFDA mensalmente e salvá-los em uma tabela do Google BigQuery.
+"""
+
+from __future__ import annotations
+
+import pendulum
+import pandas as pd
+import requests
+
+from airflow.models.dag import DAG
+from airflow.operators.python import PythonOperator
+
+# ====== CONFIGURAÇÃO ======
+GCP_PROJECT = "bigqueryenap"  # Seu projeto GCP
+BQ_DATASET = "crypto"  # Seu dataset no BigQuery
+BQ_TABLE = "FDA"  # Sua tabela no BigQuery
+BQ_LOCATION = "US"  # Localização do dataset ("US" ou "EU")
+# O GCP_CONN_ID não é usado diretamente no código, pois o pandas-gbq
+# usará a conexão padrão 'google_cloud_default' configurada na UI do Airflow.
+
+# Função para gerar a URL de consulta para um mês e ano específicos
+def generate_query_url(year: int, month: int) -> str:
+    """Gera a URL da API para o mês e ano de execução da DAG."""
+    start_date = f"{year}{month:02d}01"
+    # Calcula o último dia do mês corretamente
+    last_day_of_month = pendulum.datetime(year, month, 1).end_of("month").day
+    end_date = f"{year}{month:02d}{last_day_of_month}"
+    
+    query = (
+        f"https://api.fda.gov/drug/event.json?search=patient.drug.medicinalproduct"
+        f":%22sildenafil+citrate%22+AND+receivedate:[{start_date}+TO+{end_date}]"
+        f"&count=receivedate"
+    )
+    print(f"Generated URL: {query}")
+    return query
+
+# Função para buscar dados da API e passá-los via XCom
+def fetch_openfda_data(ti, **context):
+    """
+    Busca dados da API OpenFDA, processa-os em um DataFrame semanal
+    e o envia para a próxima tarefa via XCom em formato JSON.
+    """
+    execution_date = context["dag_run"].execution_date
+    year = execution_date.year
+    month = execution_date.month
+
+    query_url = generate_query_url(year, month)
+    response = requests.get(query_url)
+    weekly_sum = pd.DataFrame([])
+
+    if response.status_code == 200:
+        data = response.json()
+        if 'results' in data and data['results']:
+            df = pd.DataFrame(data['results'])
+            df['time'] = pd.to_datetime(df['time'])
+            # Agrupa por semana (iniciando no domingo) e soma a coluna 'count'
+            weekly_sum = df.groupby(pd.Grouper(key='time', freq='W-SUN'))['count'].sum().reset_index()
+            print("Dados processados com sucesso:")
+            print(weekly_sum.info())
+            print(weekly_sum.head())
+        else:
+            print("Nenhum resultado encontrado na resposta da API.")
+    else:
+        print(f"A requisição à API falhou com o status: {response.status_code}")
+        print(f"Resposta: {response.text}")
+        # Lança uma exceção para que a tarefa falhe e possa ser tentada novamente
+        response.raise_for_status()
+
+    # Envia o DataFrame para o XCom como uma string JSON
+    ti.xcom_push(key='openfda_data', value=weekly_sum.to_json(orient='split'))
+
+# Função para salvar os dados no Google BigQuery
+def save_to_bigquery(ti, **kwargs):
+    """
+    Recupera os dados do XCom e os salva em uma tabela do BigQuery
+    usando a biblioteca pandas-gbq.
+    """
+    # Recupera a string JSON do XCom
+    json_data = ti.xcom_pull(task_ids='fetch_openfda_data', key='openfda_data')
+
+    if not json_data or json_data == 'null':
+        print("Nenhum dado recebido da tarefa anterior. Ignorando o carregamento para o BigQuery.")
+        return
+
+    df = pd.read_json(json_data, orient='split')
+
+    if df.empty:
+        print("O DataFrame está vazio. Nenhum dado para carregar no BigQuery.")
+        return
+
+    # Garante que a coluna de data esteja no formato correto
+    df['time'] = pd.to_datetime(df['time'])
+
+    # Define o nome completo da tabela
+    table_id = f"{BQ_DATASET}.{BQ_TABLE}"
+
+    print(f"Carregando {len(df)} linhas na tabela {GCP_PROJECT}.{table_id}...")
+
+    # Salva o DataFrame no BigQuery
+    # O `pandas-gbq` usará as credenciais da conexão 'google_cloud_default' do Airflow
+    df.to_gbq(
+        destination_table=table_id,
+        project_id=GCP_PROJECT,
+        if_exists='append',
+        location=BQ_LOCATION,
+        # É uma boa prática definir o esquema para garantir consistência
+        table_schema=[
+            {'name': 'time', 'type': 'TIMESTAMP'},
+            {'name': 'count', 'type': 'INTEGER'}
+        ]
+    )
+    print("Dados carregados com sucesso no BigQuery.")
+
+# Definição da DAG
+with DAG(
+    dag_id='fetch_openfda_data_to_bq_monthly',
+    start_date=pendulum.datetime(2020, 11, 1, tz="UTC"),
+    schedule_interval='@monthly',
+    catchup=True,
+    max_active_tasks=1,
+    description='Recupera dados mensais da OpenFDA e salva no BigQuery.',
+    tags=['openfda', 'bigquery'],
+) as dag:
+    fetch_data_task = PythonOperator(
+        task_id='fetch_openfda_data',
+        python_callable=fetch_openfda_data,
+    )
+
+    save_data_task = PythonOperator(
+        task_id='save_to_bigquery',
+        python_callable=save_to_bigquery,
+    )
+
+    fetch_data_task >> save_data_task
