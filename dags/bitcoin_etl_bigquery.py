@@ -112,6 +112,7 @@ def fetch_and_to_gbq():
         "Open in Cloud IDE": "https://cloud.astronomer.io/cm3webulw15k701npm2uhu77t/cloud-ide/cm42rbvn10lqk01nlco70l0b8/cm44gkosq0tof01mxajutk86g",
     },
     tags=["bitcoin", "etl", "coingecko", "bigquery", "pandas-gbq"],
+    concurrency=1,
 )
 def bitcoin_etl_bigquery():
     fetch_and_to_gbq()
