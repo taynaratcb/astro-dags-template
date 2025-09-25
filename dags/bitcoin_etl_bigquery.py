@@ -106,7 +106,6 @@ def fetch_and_to_gbq():
     schedule="0 0 * * *",  # daily at 00:00 UTC
     start_date=pendulum.datetime(2025, 9, 17, tz="UTC"),
     catchup=True,
-    concurrency=1,
     max_active_runs=1,
     owner_links={
         "Alex Lopes": "mailto:alexlopespereira@gmail.com",
