@@ -1,4 +1,4 @@
-python
+```python
 # dags/openfda_cosmetic_events_to_bigquery_v2.py
 
 from __future__ import annotations
@@ -16,6 +16,10 @@ BQ_TABLE = "cosmetic_events_weekly"
 GCP_CONN_ID = "google_cloud_default"
 # =================================================================
 
+DEFAULT_ARGS = {
+    "email_on_failure": True,
+    "owner": "Alex Lopes,Open in Cloud IDE",
+}
 
 @dag(
     dag_id="openfda_cosmetic_events_to_bigquery_v2",
@@ -25,15 +29,15 @@ GCP_CONN_ID = "google_cloud_default"
     catchup=True,
     tags=["openfda", "cosmetics", "bigquery", "v2"],
     max_active_runs=1,
+    default_args=DEFAULT_ARGS,
+    owner_links={
+        "Alex Lopes": "mailto:alexlopespereira@gmail.com",
+        "Open in Cloud IDE": "https://cloud.astronomer.io/cm3webulw15k701npm2uhu77t/cloud-ide/cm42rbvn10lqk01nlco70l0b8/cm44gkosq0tof01mxajutk86g",
+    },
 )
 def cosmetic_events_etl_dag_v2():
     """
     ### DAG de ETL para Eventos Adversos de Cosméticos (Versão 2 - Idempotente)
-
-    Este pipeline realiza as seguintes etapas:
-    1.  **Extrai e Transforma**: Busca dados mensais da API openFDA e os agrega por semana.
-    2.  **Carrega**: Garante que os dados do período sejam limpos da tabela de destino
-        antes de inserir os novos, evitando duplicatas.
     """
 
     @task
@@ -60,60 +64,44 @@ def cosmetic_events_etl_dag_v2():
         df['time'] = pd.to_datetime(df['time'], format="%Y%m%d")
         weekly_sum = df.groupby(pd.Grouper(key='time', freq='W-SUN'))['count'].sum().reset_index()
         weekly_sum.rename(columns={'time': 'week_start_date', 'count': 'total_events'}, inplace=True)
-        print("Dados agregados por semana:")
-        print(weekly_sum.head())
         return weekly_sum
 
     @task
     def load_to_bigquery(df: pd.DataFrame):
-        """
-        Salva o DataFrame no BigQuery de forma idempotente.
-        Primeiro, deleta os dados do período correspondente e depois insere os novos.
-        """
         if df.empty:
             print("DataFrame vazio. Nenhuma ação de carga será executada.")
             return
 
         df['week_start_date'] = pd.to_datetime(df['week_start_date']).dt.date
-        
-        # Pega a data mínima e máxima do DataFrame para definir o período a ser limpo
         min_date = df['week_start_date'].min().strftime('%Y-%m-%d')
         max_date = df['week_start_date'].max().strftime('%Y-%m-%d')
-
-        print(f"Limpando dados na tabela de destino entre {min_date} e {max_date}...")
 
         destination_table = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
         bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, use_legacy_sql=False)
 
-        # SQL para deletar os registros no intervalo de datas do DataFrame atual
         delete_sql = (
             f"DELETE FROM `{destination_table}` "
             f"WHERE week_start_date >= '{min_date}' AND week_start_date <= '{max_date}'"
         )
-        
-        # Executa a query de deleção
         bq_hook.run_query(sql=delete_sql)
-        
-        print("Dados antigos do período foram limpos. Carregando novos dados...")
 
         table_schema = [
             {"name": "week_start_date", "type": "DATE"},
             {"name": "total_events", "type": "INTEGER"},
         ]
-        
+
         df.to_gbq(
             destination_table=destination_table,
             project_id=GCP_PROJECT,
             credentials=bq_hook.get_credentials(),
-            if_exists="append", # Agora 'append' é seguro, pois limpamos a janela de dados
+            if_exists="append",
             table_schema=table_schema,
             progress_bar=False,
         )
         print(f"Carregados {len(df)} registros para a tabela: {destination_table}.")
 
-    # Define o fluxo de tarefas
     weekly_data_df = fetch_and_transform_data()
     load_to_bigquery(weekly_data_df)
 
-# Instancia a DAG
-cosmetic_events_etl_dag_v2()
+dag = cosmetic_events_etl_dag_v2()
+```
