@@ -1,4 +1,4 @@
-```python
+python
 # dags/openfda_cosmetic_events_to_bigquery_v2.py
 
 from __future__ import annotations
@@ -117,4 +117,3 @@ def cosmetic_events_etl_dag_v2():
 
 # Instancia a DAG
 cosmetic_events_etl_dag_v2()
-```
