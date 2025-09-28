@@ -1,0 +1,130 @@
+# dags/cosmetic_events_to_bq_dag.py
+
+from __future__ import annotations
+
+from airflow.decorators import dag, task
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+
+import pendulum
+import pandas as pd
+import requests
+from datetime import timedelta
+
+# ========================= CONFIGURAÇÕES =========================
+# ⚠️ Altere estas variáveis com os dados do seu projeto no GCP
+GCP_PROJECT = "bigqueryenap"
+BQ_DATASET = "FDA"
+BQ_TABLE = "cosmetic_events_weekly"
+GCP_CONN_ID = "google_cloud_default"  # ID da sua conexão GCP no Airflow
+# =================================================================
+
+@dag(
+    dag_id="openfda_cosmetic_events_to_bigquery",
+    description="Busca eventos adversos de cosméticos mensalmente e salva o agregado semanal no BigQuery.",
+    schedule="@monthly",  # Executa no início de cada mês
+    start_date=pendulum.datetime(2023, 1, 1, tz="UTC"),
+    catchup=True, # Se True, executa DAGs perdidas desde a start_date
+    tags=["openfda", "cosmetics", "bigquery", "etl"],
+    max_active_runs=1,
+)
+def cosmetic_events_etl_dag():
+    """
+    ### DAG de ETL para Eventos Adversos de Cosméticos
+
+    Este pipeline realiza as seguintes etapas:
+    1.  **Extrai** dados da API openFDA para eventos de cosméticos, agregados por dia para o mês da execução.
+    2.  **Transforma** os dados diários em um agregado semanal.
+    3.  **Carrega** o resultado em uma tabela no Google BigQuery.
+    """
+
+    @task
+    def fetch_and_transform_data(data_interval_start: pendulum.DateTime) -> pd.DataFrame:
+        """
+        Busca os dados do mês da execução na API do openFDA.
+        """
+        # Extrai o mês e ano do início do intervalo de execução da DAG
+        year = data_interval_start.year
+        month = data_interval_start.month
+
+        # Calcula o primeiro e o último dia do mês
+        start_date = f"{year}{month:02d}01"
+        last_day = data_interval_start.end_of("month").day
+        end_date = f"{year}{month:02d}{last_day}"
+
+        print(f"Buscando dados para o período de {start_date} a {end_date}")
+
+        # Monta a URL da API para contar eventos por data de recebimento
+        api_url = (
+            "https://api.fda.gov/cosmetic/event.json?"
+            f"search=initial_received_date:[{start_date}+TO+{end_date}]"
+            "&count=initial_received_date"
+        )
+
+        response = requests.get(api_url, timeout=30)
+        response.raise_for_status()  # Lança um erro se a requisição falhar
+
+        data = response.json()
+        df = pd.DataFrame(data.get("results", []))
+
+        if df.empty:
+            print("Nenhum dado encontrado para o período.")
+            return pd.DataFrame()
+
+        # Converte a coluna 'time' para datetime
+        df['time'] = pd.to_datetime(df['time'], format="%Y%m%d")
+
+        # Agrupa por semana (iniciando no domingo, 'W-SUN') e soma a contagem
+        weekly_sum = df.groupby(pd.Grouper(key='time', freq='W-SUN'))['count'].sum().reset_index()
+
+        # Renomeia as colunas para clareza
+        weekly_sum.rename(columns={'time': 'week_start_date', 'count': 'total_events'}, inplace=True)
+
+        print("Dados agregados por semana:")
+        print(weekly_sum.head())
+
+        return weekly_sum
+
+    @task
+    def load_to_bigquery(df: pd.DataFrame):
+        """
+        Salva o DataFrame de eventos semanais em uma tabela do BigQuery.
+        """
+        if df.empty:
+            print("DataFrame vazio. Nenhuma ação será tomada.")
+            return
+
+        # Garante que a coluna de data seja do tipo correto para o BQ
+        df['week_start_date'] = pd.to_datetime(df['week_start_date']).dt.date
+
+        destination_table = f"{GCP_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+        print(f"Carregando {len(df)} registros para a tabela: {destination_table}")
+
+        # Usa o hook do BigQuery para obter as credenciais da conexão do Airflow
+        bq_hook = BigQueryHook(gcp_conn_id=GCP_CONN_ID, use_legacy_sql=False)
+        credentials = bq_hook.get_credentials()
+
+        # Define o esquema da tabela para garantir os tipos de dados corretos
+        # Isso é especialmente útil na primeira vez que a tabela é criada.
+        table_schema = [
+            {"name": "week_start_date", "type": "DATE"},
+            {"name": "total_events", "type": "INTEGER"},
+        ]
+
+        # Usa pandas_gbq para carregar os dados
+        df.to_gbq(
+            destination_table=destination_table,
+            project_id=GCP_PROJECT,
+            credentials=credentials,
+            if_exists="append",  # Adiciona os novos dados aos existentes
+            table_schema=table_schema,
+            progress_bar=False,
+        )
+
+        print("Carga para o BigQuery concluída com sucesso!")
+
+    # Define o fluxo de tarefas
+    weekly_data_df = fetch_and_transform_data(data_interval_start="{{ data_interval_start }}")
+    load_to_bigquery(weekly_data_df)
+
+# Instancia a DAG
+cosmetic_events_etl_dag()
