@@ -1,3 +1,4 @@
+```python
 # dags/openfda_cosmetic_events_to_bigquery_v2.py
 
 from __future__ import annotations
@@ -111,8 +112,9 @@ def cosmetic_events_etl_dag_v2():
         print(f"Carregados {len(df)} registros para a tabela: {destination_table}.")
 
     # Define o fluxo de tarefas
-    weekly_data_df = fetch_and_transform_data(data_interval_start="{{ data_interval_start }}")
+    weekly_data_df = fetch_and_transform_data()
     load_to_bigquery(weekly_data_df)
 
 # Instancia a DAG
 cosmetic_events_etl_dag_v2()
+```
